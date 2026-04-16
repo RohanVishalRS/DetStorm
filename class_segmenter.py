@@ -1,30 +1,5 @@
-#Keras update imports
 import os
 import fileinput
-
-# Define the path to the file that needs to be modified
-FILE_PATH = "C:\\Users\\Scott Moran\\AppData\\Local\\Packages\\PythonSoftwareFoundation.Python.3.10_qbz5n2kfra8p0\\LocalCache\\local-packages\\Python310\\site-packages\\pixellib\\semantic\\deeplab.py"
-
-# Define the old and new strings that need to be replaced
-OLD_STRING = "tensorflow.python.keras"
-NEW_STRING = "tensorflow.keras"
-
-# Use fileinput to replace the old string with the new string in the file
-for line in fileinput.input(FILE_PATH, inplace=True):
-    print(line.replace(OLD_STRING, NEW_STRING), end='')
-
-# Define the old and new strings that need to be replaced
-# This handles model loading errors
-OLD_STRING = "tensorflow.keras.utils.layer_utils import get_source_inputs"
-NEW_STRING = "tensorflow.python.keras.utils.layer_utils import get_source_inputs"
-
-# Use fileinput to replace the old string with the new string in the file
-for line in fileinput.input(FILE_PATH, inplace=True):
-    print(line.replace(OLD_STRING, NEW_STRING), end='')
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-##################################################################
-
 import glob
 import pixellib
 from pixellib.semantic import semantic_segmentation
@@ -32,37 +7,77 @@ import segment
 import cv2
 import numpy as np
 import sys
-
 import calendar
 import time
-#load model
+import logging  # Added for log file support
+
+# --- Logging Configuration ---
+# This sets up the format to include a timestamp for better traceability
+log_filename = "segmentation_log.txt"
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename)
+    ]
+)
+
+# --- Keras Import Patching ---
+FILE_PATH = "Repo\\DetStorm\\.venv\\Lib\\site-packages\\pixellib\\semantic\\deeplab.py"
+
+
+def patch_file(path, old, new):
+    for line in fileinput.input(path, inplace=True):
+        print(line.replace(old, new), end='')
+
+
+patch_file(FILE_PATH, "tensorflow.python.keras", "tensorflow.keras")
+patch_file(FILE_PATH, "tensorflow.keras.utils.layer_utils import get_source_inputs",
+           "tensorflow.python.keras.utils.layer_utils import get_source_inputs")
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+
+# --- Initialization ---
 segment_image = semantic_segmentation()
-segment_image.load_ade20k_model("deeplabv3_xception65_ade20k.h5")
+segment_image.load_ade20k_model("downloaded_models/deeplabv3_xception65_ade20k.h5")
 
-#get image directory
-img_directory = 'C:\\Users\\Scott Moran\\Documents\\Research\\NMSProject-master\\PhantomSponges\\BDD_Dir\\BDD_IMG_DIR'
 
-out_directory = 'C:\\Users\\Scott Moran\\Documents\\Research\\NMSProject-master\\out_segments'
+img_directory = '.\\bdd100k_images_100k\\100k\\test'
+out_directory = '.\\out_segments'
+current_out_dir = os.path.join(out_directory, str(calendar.timegm(time.gmtime())))
 
-current_out_dir = out_directory + '\\' + str(calendar.timegm(time.gmtime()))
-#create the directory
-os.mkdir(current_out_dir)
+if not os.path.exists(current_out_dir):
+    os.makedirs(current_out_dir)
 
-#loop through
-print("Out folder: " + current_out_dir.split("\\")[-1])
+logging.info(f"Output directory initialized: {current_out_dir}")
+
+# --- Processing Loop ---
 idx_counter = 0
-for impath in glob.iglob(img_directory + '\\*'):
+
+for impath in glob.iglob(os.path.join(img_directory, '*')):
     return_masks, return_ims = segment.segmentation_mask(segment_image, impath)
     idx_counter += 1
-    print("Step " + str(idx_counter) + ": "  + ''.join(impath.split("\\")[-1].split('.')[:-1]))
-    #Loop through each returned value and save accordingly
-    for cls in return_masks:
-        #Make directory if we need
-        cls_folder = current_out_dir + '\\' + cls + '\\'
-        if(len(return_masks[cls]) > 0) and not os.path.exists(cls_folder):
-            os.mkdir(cls_folder)
-        for i in range(0, len(return_masks[cls])):
-            #Save image
-            cv2.imwrite(cls_folder + ''.join(impath.split("\\")[-1].split('.')[:-1]) + '_' + str(i) + '.jpg', return_ims[cls][i])
-            #save npz
-            np.save(cls_folder + ''.join(impath.split("\\")[-1].split('.')[:-1]) + '_' + str(i) + '.npy', return_masks[cls][i])    
+
+    # Calculate mask count for the current image
+    current_image_mask_count = sum(len(masks) for masks in return_masks.values())
+    img_name = os.path.splitext(os.path.basename(impath))[0]
+
+    # Requirement 2: Log masks present for each image
+    logging.info(f"Image {idx_counter}: {img_name} | Masks count: {current_image_mask_count}")
+
+    for cls, masks in return_masks.items():
+        cls_folder = os.path.join(current_out_dir, cls)
+
+        if len(masks) > 0 and not os.path.exists(cls_folder):
+            os.makedirs(cls_folder)
+
+        for i in range(len(masks)):
+            file_base = f"{img_name}_{i}"
+            cv2.imwrite(os.path.join(cls_folder, f"{file_base}.jpg"), return_ims[cls][i])
+            np.save(os.path.join(cls_folder, f"{file_base}.npy"), masks[i])
+
+# Requirement 1: Log total number of images
+logging.info("-" * 40)
+logging.info("Processing Summary")
+logging.info(f"Total number of images processed: {idx_counter}")
+logging.info("-" * 40)
