@@ -37,21 +37,36 @@ def get_vectorized_intersections(boxes):
     return inter_area[mask]
 
 
-def compute_bboxes_area_loss_vectorized(boxes_x1, patch_size, top_k=100):
-    """BBox spread/overlap loss, capped at top_k boxes to prevent VRAM hang."""
+def compute_bboxes_area_loss_vectorized(boxes_x1, zone_tl, zone_br, top_k=100):
+    """
+    boxes_x1 : [N, 4] tensor of (x1,y1,x2,y2) — Cb (all candidates before threshold)
+    zone_tl  : (x, y) top-left corner of zone     — α
+    zone_br  : (x, y) bottom-right corner of zone — β
+    """
     if boxes_x1.shape[0] > top_k:
         boxes_x1 = boxes_x1[:top_k]
     if len(boxes_x1) < 2:
-        if len(boxes_x1) == 1:
-            wh = boxes_x1[:, 2:] - boxes_x1[:, :2]
-            return (wh[:, 0] * wh[:, 1]).mean() / (patch_size[0] * patch_size[1])
         return torch.tensor(0.0, device=boxes_x1.device, requires_grad=True)
-    l1_dists  = get_vectorized_distances(boxes_x1, p=1)
-    l2_dists  = get_vectorized_distances(boxes_x1, p=2)
+
+    # Zone normalization factors
+    d1_zone = abs(zone_br[0] - zone_tl[0]) + abs(zone_br[1] - zone_tl[1])  # L1 diagonal
+    d2_zone = ((zone_br[0]-zone_tl[0])**2 + (zone_br[1]-zone_tl[1])**2)**0.5  # L2 diagonal
+    zone_area = abs(zone_br[0] - zone_tl[0]) * abs(zone_br[1] - zone_tl[1])
+
+    N = len(boxes_x1)
+
+    # L1 loss — MINIMIZE distances (pack boxes together)
+    l1_dists = get_vectorized_distances(boxes_x1, p=1)
+    l1_loss  = l1_dists.mean() / d1_zone          # want this → 0
+
+    # L2 loss — MINIMIZE distances
+    l2_dists = get_vectorized_distances(boxes_x1, p=2)
+    l2_loss  = l2_dists.mean() / d2_zone          # want this → 0
+
+    # Intersection loss — MINIMIZE max intersection (Eq. 11)
     inter_areas = get_vectorized_intersections(boxes_x1)
-    l1_loss   = l1_dists.mean()   / (patch_size[0] + patch_size[1])
-    l2_loss   = l2_dists.mean()   / math.sqrt(patch_size[0]**2 + patch_size[1]**2)
-    inter_loss = inter_areas.max() / (patch_size[0] * patch_size[1])
+    inter_loss  = inter_areas.max() / zone_area   # want this → 0
+
     return (l1_loss + l2_loss + inter_loss) / 3
 
 
@@ -148,8 +163,16 @@ class PhantomGenerator:
                     outputs = outputs[0]                          # [B, 25200, 85]
 
                 # 1. Objectness / confidence loss
-                class_confs = outputs[:, :, 4] * outputs[:, :, 5 + target_class]
-                max_obj_loss = torch.mean(torch.clamp(conf_thres - class_confs, min=0))
+                # Cb = all anchors before threshold
+                cb_confs = outputs[:, :, 4] * outputs[:, :, 5 + target_class]  # [B, 25200]
+                N_cb = cb_confs.shape[1]
+
+                # Ca = anchors above threshold
+                ca_mask  = cb_confs > conf_thres                                 # [B, 25200]
+
+                # Sum conf of Ca boxes, divide by |Cb| — then negate to minimize
+                # (more Ca boxes above threshold = lower loss)
+                max_obj_loss = -((cb_confs * ca_mask.float()).sum(dim=1) / N_cb).mean()
 
                 # 2. BBox area / spread loss
                 area_losses = []
@@ -160,9 +183,11 @@ class PhantomGenerator:
                     last_num_boxes = len(boxes)
                     if len(boxes) > 0:
                         _, idx = torch.sort(boxes[:, 4], descending=True)
+                        zone_tl = (0, 0)
+                        zone_br = (self.patch_size[1], self.patch_size[0])  # (640, 640)
                         area_losses.append(
                             compute_bboxes_area_loss_vectorized(
-                                boxes[idx][:, :4], self.patch_size, top_k=2000
+                                boxes[idx][:, :4], zone_tl, zone_br, top_k=2000
                             )
                         )
 
@@ -196,14 +221,11 @@ class PhantomGenerator:
             if curr_iter % 10 == 0:
                 print(f"  Iter {curr_iter:4d} | Loss: {epoch_loss:.4f} "
                       f"| Last-batch boxes: {last_num_boxes}")
-
-            patch_cpu = adv_patch.detach().cpu()
-            torch.save(patch_cpu, iter_patch_dir / f'patch_iter_{curr_iter:04d}.pt')
-            if curr_iter % 10 == 0:
+                patch_cpu = adv_patch.detach().cpu()
                 transforms.ToPILImage()(patch_cpu).save(
                     iter_patch_dir / f'patch_iter_{curr_iter:04d}.png'
                 )
-
+                
         # ── Final save ────────────────────────────────────────────────────
         final_patch = adv_patch.detach().cpu()
         torch.save(final_patch, save_path / 'final_patch.pt')
@@ -269,7 +291,7 @@ def run_attack(max_iter, fgsm_epsilon, img_paths, folder_name,
 
 if __name__ == '__main__':
     # ── Configuration ─────────────────────────────────────────────────────
-    MINI_BATCH_SIZE = 8       # images per mini-batch  (tune to fit VRAM)
+    MINI_BATCH_SIZE = 16       # images per mini-batch  (tune to fit VRAM)
     ITERATIONS      = 1000    # patch update steps per class
     EPSILON         = 0.005   # FGSM step size
 
@@ -287,7 +309,7 @@ if __name__ == '__main__':
     }
 
     # ── Resume / skip logic ───────────────────────────────────────────────
-    skip_until_class = 'refrigerator'
+    skip_until_class = None
     found_skip       = False
 
     global_patch = None
@@ -305,7 +327,7 @@ if __name__ == '__main__':
             folder_name = Path(cls_path).name
 
             # Skip until the target class is reached
-            if not found_skip:
+            if skip_until_class is not None and not found_skip:
                 if folder_name == skip_until_class:
                     print(f"[Skip] Resuming from class: {folder_name}")
                     found_skip = True
@@ -320,6 +342,10 @@ if __name__ == '__main__':
 
             if not img_paths:
                 print(f"  [Skip] No .jpg images found.")
+                continue
+                
+            if not is_important:
+                print(f"  [Skip] Important: {is_important}")
                 continue
 
             print(f"  Found {len(img_paths)} images | Important: {is_important}")
