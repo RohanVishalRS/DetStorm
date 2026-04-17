@@ -3,6 +3,7 @@ from pathlib import Path
 import cv2
 import torch
 import numpy as np
+import torchvision
 from torchvision import transforms
 from torch.utils.data import Dataset, DataLoader
 import os
@@ -26,70 +27,86 @@ def get_vectorized_distances(boxes, p=2):
 
 
 def get_vectorized_intersections(boxes):
-    """Computes all-pairs intersection areas using broadcasting."""
-    b1 = boxes.unsqueeze(1)
-    b2 = boxes.unsqueeze(0)
-    xA = torch.max(b1[..., 0], b2[..., 0])
-    yA = torch.max(b1[..., 1], b2[..., 1])
-    xB = torch.min(b1[..., 2], b2[..., 2])
-    yB = torch.min(b1[..., 3], b2[..., 3])
-    inter_area = torch.clamp(xB - xA, min=0) * torch.clamp(yB - yA, min=0)
-    mask = torch.triu(torch.ones_like(inter_area), diagonal=1).bool()
+    """Follows paper Eq 9-10: measures max-extent overflow between box pairs."""
+    b1 = boxes.unsqueeze(1)  # (N, 1, 4)
+    b2 = boxes.unsqueeze(0)  # (1, N, 4)
+
+    # Eq 9: max extents of each box on each axis
+    # For xyxy format: x2 > x1, y2 > y1, so max is just x2, y2
+    Xa = torch.max(b1[..., 0], b1[..., 2])  # max x of Bi = x2 of Bi
+    Xb = torch.max(b2[..., 0], b2[..., 2])  # max x of Bj = x2 of Bj
+    Ya = torch.max(b1[..., 1], b1[..., 3])  # max y of Bi = y2 of Bi
+    Yb = torch.max(b2[..., 1], b2[..., 3])  # max y of Bj = y2 of Bj
+
+    # Eq 10
+    inter_area = torch.abs(
+        torch.clamp(Xb - Xa, min=0) * torch.clamp(Yb - Ya, min=0)
+    )
+
+    mask = torch.triu(torch.ones(inter_area.shape, device=boxes.device), diagonal=1).bool()
     return inter_area[mask]
 
 
 def compute_bboxes_area_loss_vectorized(boxes_x1, mask_tensor, top_k=100):
-    """
-    mask_tensor: [640, 640] boolean tensor of the specific object zone
-    """
     if boxes_x1.shape[0] > top_k:
         boxes_x1 = boxes_x1[:top_k]
-    if len(boxes_x1) < 2 or not mask_tensor.any():
-        return torch.tensor(0.0, device=boxes_x1.device, requires_grad=True)
+
+    zero = boxes_x1.sum() * 0.0
+
+    if boxes_x1.shape[0] < 2 or not mask_tensor.any():
+        return zero
 
     pos = torch.where(mask_tensor)
     z_ymin, z_xmin = pos[0].min(), pos[1].min()
     z_ymax, z_xmax = pos[0].max(), pos[1].max()
 
-    width = (z_xmax - z_xmin).float() + 1e-6
-    height = (z_ymax - z_ymin).float() + 1e-6
+    width  = (z_xmax - z_xmin).float()
+    height = (z_ymax - z_ymin).float()
 
     d1_zone = width + height
     d2_zone = (width ** 2 + height ** 2) ** 0.5
-    zone_area = (width * height) + 1e-6  # α·β bounding rectangle area (Eq. 11)
+    zone_area = width * height
 
     l1_loss = get_vectorized_distances(boxes_x1, p=1).mean() / d1_zone
     l2_loss = get_vectorized_distances(boxes_x1, p=2).mean() / d2_zone
 
     inter_areas = get_vectorized_intersections(boxes_x1)
-    inter_loss = inter_areas.max() / zone_area
+    inter_loss  = torch.clamp(inter_areas.max() / zone_area, max=1.0)
 
     return (l1_loss + l2_loss + inter_loss) / 3
 
 
-def compute_max_objects_loss(output_patch, target_class=0, conf_thres=0.25):
-    # Compute class-weighted confidence scores: (batch, anchors, num_classes)
-    x2 = output_patch[:, :, 5:] * output_patch[:, :, 4:5]
+def compute_max_objects_loss(zone_target_conf, conf_thres=0.25):
+    """
+    Computes max_objects_loss (Eq. 3 + Eq. 4) for a single image's zone-filtered
+    target-class confidences.
 
-    conf, j = x2.max(2, keepdim=False)
-    all_target_conf = x2[:, :, target_class]
-    under_thr_target_conf = all_target_conf[conf < conf_thres]
+    Args:
+        zone_target_conf: 1-D tensor of target-class confidence scores for all
+                          anchors whose centroid falls inside the zone (|Cb| entries).
+        conf_thres:       Confidence threshold Tconf.
 
-    # Fix: normalize by total number of predictions (|Cb|), not just batch size (Eq. 4)
-    total_preds = conf.numel()
-    conf_avg = (conf.view(-1) > conf_thres).sum().item() / total_preds
+    Returns:
+        loss:      Scalar loss tensor (differentiable).
+        above_count: Number of anchors already above the threshold (int).
+    """
+    total_preds_zone = zone_target_conf.numel()
+    above_count = (zone_target_conf >= conf_thres).sum().item()
 
-    # Guard against empty candidate set — avoids autograd crash on zero-element tensors
-    if under_thr_target_conf.numel() == 0:
-        return torch.tensor(0.0, device=output_patch.device, requires_grad=True), conf_avg
+    if total_preds_zone == 0:
+        return torch.tensor(0.0, device=zone_target_conf.device, requires_grad=True), above_count
 
-    # Eq. 3: conf(B) = max(Tconf - Bconf, 0) — no gradient incentive above threshold
-    x3 = torch.clamp(-under_thr_target_conf + conf_thres, min=0)
+    under_thr_mask = zone_target_conf < conf_thres
+    under_thr_conf = zone_target_conf[under_thr_mask]
 
-    # Eq. 4: max_obj = (1 / |Cb|) * sum over Ca of conf(B)
-    mean_conf = x3.sum() / total_preds
+    if under_thr_conf.numel() == 0:
+        return zone_target_conf.sum() * 0.0, above_count  # zero with grad
 
-    return mean_conf, conf_avg
+    # Eq. 3 + Eq. 4
+    x3 = torch.clamp(conf_thres - under_thr_conf, min=0)
+    loss = x3.sum() / total_preds_zone
+
+    return loss, above_count
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +157,6 @@ class PhantomGenerator:
 
         self.conf_threshold = 0.25
         self.iou_threshold = 0.45
-        self.patch_conf_threshold = 0.001
         self.time = []
 
         # Load YOLOv5 model directly from torch hub
@@ -152,49 +168,65 @@ class PhantomGenerator:
         print(f"[Model] Loaded on {self.device}")
 
     def loss_func(self, loss_hypers, target_class, output_patch, mask_tensors=None):
-        """
-        Full loss from Eq. 12:
-            L = lambda_1 * max_obj + lambda_2 * (l1 + l2 + inter) / 3
-        """
-        # --- Term 1: max_obj loss (Eq. 3 & 4) ---
-        max_objects_loss, pass_to_NMS = compute_max_objects_loss(output_patch, target_class,
-                                                                 conf_thres=self.conf_threshold)
-        loss = max_objects_loss * loss_hypers['lambda_1']
+        x2 = output_patch[:, :, 5:] * output_patch[:, :, 4:5]
+        conf, _ = x2.max(2)
+        cx = output_patch[..., 0]
+        cy = output_patch[..., 1]
+        w = output_patch[..., 2]
+        h = output_patch[..., 3]
+        boxes_xyxy = torch.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], dim=-1)
 
-        # --- Term 2: spatial spread loss (Eq. 6, 8, 11) ---
-        if loss_hypers.get('lambda_2a', 0) > 0 and mask_tensors is not None:
-            # Extract candidate boxes (Cb): all predictions above patch_conf_threshold
-            # output_patch shape: (batch, 25200, 85) — [cx, cy, w, h, obj_conf, cls...]
-            x2 = output_patch[:, :, 5:] * output_patch[:, :, 4:5]
-            conf, _ = x2.max(2)  # (batch, 25200)
+        zero = output_patch.sum() * 0.0
+        max_objects_loss_total = zero
+        bbox_area_loss = zero
+        valid_count = 0
+        total_preds_all = 0
+        pass_to_NMS_total = 0
 
-            # Gather boxes above patch confidence threshold across the whole batch
-            above_mask = conf > self.patch_conf_threshold  # (batch, 25200)
-            raw_boxes = output_patch[:, :, :4]  # cx, cy, w, h
+        for i in range(output_patch.shape[0]):
+            zone_mask_i = mask_tensors[i].to(self.device)
 
-            # Convert cx,cy,w,h → x1,y1,x2,y2 for all predictions, then filter
-            cx = raw_boxes[..., 0]
-            cy = raw_boxes[..., 1]
-            w  = raw_boxes[..., 2]
-            h  = raw_boxes[..., 3]
-            x1 = cx - w / 2
-            y1 = cy - h / 2
-            x2_coord = cx + w / 2
-            y2_coord = cy + h / 2
-            boxes_xyxy = torch.stack([x1, y1, x2_coord, y2_coord], dim=-1)  # (batch, 25200, 4)
+            if not zone_mask_i.any():
+                continue
 
-            # Flatten across batch and keep only above-threshold candidates
-            boxes_flat = boxes_xyxy.view(-1, 4)
-            mask_flat  = above_mask.view(-1)
-            candidate_boxes = boxes_flat[mask_flat]  # (N_candidates, 4)
+            # --- Get zone bounding box in PIXEL coords ---
+            pos = torch.where(zone_mask_i)
+            z_ymin, z_xmin = pos[0].min().float(), pos[1].min().float()
+            z_ymax, z_xmax = pos[0].max().float(), pos[1].max().float()
 
-            # Use the first mask in the batch as the zone reference
-            zone_mask = mask_tensors[0].to(self.device)
+            # --- Normalize to [0, 1] to match YOLO anchor coords ---
+            box_cx = (boxes_xyxy[i, :, 0] + boxes_xyxy[i, :, 2]) / 2
+            box_cy = (boxes_xyxy[i, :, 1] + boxes_xyxy[i, :, 3]) / 2
+            in_zone = (
+                    (box_cx >= z_xmin) & (box_cx <= z_xmax) &
+                    (box_cy >= z_ymin) & (box_cy <= z_ymax)
+            )
 
-            bbox_area_loss = compute_bboxes_area_loss_vectorized(candidate_boxes, zone_mask)
-            loss = loss + bbox_area_loss * loss_hypers['lambda_2a']
+            # --- Term 1: max_objects_loss restricted to zone ---
+            zone_target_conf = x2[i, :, target_class][in_zone]
+            total_preds_all += zone_target_conf.numel()
 
-        return loss
+            img_obj_loss, above_count = compute_max_objects_loss(zone_target_conf, conf_thres=self.conf_threshold)
+            pass_to_NMS_total += above_count
+            max_objects_loss_total = max_objects_loss_total + img_obj_loss
+
+            # --- Term 2: spatial loss restricted to zone ---
+            if loss_hypers.get('lambda_2a', 0) > 0 and mask_tensors is not None:
+                above_mask_i = conf[i] > self.conf_threshold
+                in_zone_above = in_zone & above_mask_i
+                candidate_boxes_i = boxes_xyxy[i][in_zone_above]
+
+                img_loss = compute_bboxes_area_loss_vectorized(candidate_boxes_i, zone_mask_i, top_k=2000)
+                if not torch.isnan(img_loss):
+                    bbox_area_loss = bbox_area_loss + img_loss
+                    valid_count += 1
+
+        n_images = output_patch.shape[0]
+        max_objects_loss = max_objects_loss_total / n_images
+        l1_l2_IoU_loss = (bbox_area_loss / valid_count) if valid_count > 0 else zero
+        pass_to_NMS = pass_to_NMS_total / n_images
+
+        return max_objects_loss, l1_l2_IoU_loss, pass_to_NMS
 
     def generate_phantom(self, dataloader, loss_hypers, target_class, pgd_epsilon, fgsm_epsilon, folder_name=None,
                          warm_start_patch=None):
@@ -215,46 +247,80 @@ class PhantomGenerator:
         save_patch_dir = final_dir / 'save_patch'
         save_patch_dir.mkdir(parents=True, exist_ok=True)
 
-        data_iter = iter(dataloader)
-
         for curr_iter in range(1, self.max_iter + 1):
             self.time.append(time.time() - start)
 
-            # Fetch next mini-batch, resetting iterator if it runs out
-            try:
-                victim_imgs, mask_tensors = next(data_iter)
-            except StopIteration:
-                data_iter = iter(dataloader)
-                victim_imgs, mask_tensors = next(data_iter)
+            # --------------------------------------------------------- #
+            # ACCUMULATE GRADIENTS OVER THE FULL DATALOADER (one epoch)
+            # --------------------------------------------------------- #
+            accumulated_grad = None
+            epoch_loss = 0.0
+            epoch_max_obj_loss = 0.0
+            epoch_dist_loss = 0.0
+            epoch_pass_to_NMS = 0.0
+            epoch_total_images = 0
+            num_batches = 0
+            last_output_patch = None
 
-            victim_imgs = victim_imgs.to(self.device)
-            mask_tensors = mask_tensors.to(self.device)
+            for victim_imgs, mask_tensors in dataloader:
+                victim_imgs = victim_imgs.to(self.device)
+                mask_tensors = mask_tensors.to(self.device)
 
-            # 2. Add patch locally and clamp
-            applied_patch = torch.clamp(victim_imgs + adv_patch, 0.0, 1.0)
+                # 2. Add patch locally and clamp
+                mask_3c = mask_tensors.float().unsqueeze(1).expand(-1, 3, -1, -1)  # (B, 3, H, W)
+                applied_patch = torch.clamp(victim_imgs + adv_patch * mask_3c, 0.0, 1.0)
 
-            # 3. Forward pass through YOLO
-            output_patch = self.model(applied_patch)[0]  # (batch, 25200, 85)
+                # 3. Forward pass through YOLO
+                output_patch = self.model(applied_patch)[0]  # (batch, 25200, 85)
+                last_output_patch = output_patch
 
-            # 4. Calculate Loss (Eq. 12: max_obj + spatial spread terms)
-            loss = self.loss_func(loss_hypers, target_class, output_patch, mask_tensors=mask_tensors)
+                # 4. Calculate Loss (Eq. 12: max_obj + spatial spread terms)
+                max_objects_loss, l1_l2_IoU_loss, pass_to_NMS = self.loss_func(
+                    loss_hypers, target_class, output_patch, mask_tensors=mask_tensors
+                )
+                loss = max_objects_loss * loss_hypers['lambda_1'] + l1_l2_IoU_loss * loss_hypers['lambda_2a']
+
+                if not loss.requires_grad:
+                    continue
+
+                # Accumulate gradient for this mini-batch
+                batch_grad = torch.autograd.grad(outputs=loss, inputs=adv_patch, allow_unused=True)[0]
+                if batch_grad is not None:
+                    accumulated_grad = batch_grad if accumulated_grad is None else accumulated_grad + batch_grad
+
+                batch_size = victim_imgs.shape[0]
+                # Accumulate totals (loss_func returns per-image averages, so scale back up)
+                epoch_loss += loss.item() * batch_size
+                epoch_max_obj_loss += max_objects_loss.item() * batch_size
+                epoch_dist_loss += l1_l2_IoU_loss.item() * batch_size
+                epoch_pass_to_NMS += pass_to_NMS * batch_size  # pass_to_NMS is per-image avg
+                epoch_total_images += batch_size
+                num_batches += 1
+
+            if accumulated_grad is None or num_batches == 0:
+                print(f"[Iter {curr_iter}] No valid gradients this epoch; skipping update")
+                continue
+
+            # Average the accumulated gradient over all mini-batches
+            avg_grad = accumulated_grad / num_batches
 
             # --------------------------------------------------------- #
-            # EXPLICIT GRADIENT CALCULATION & UPDATE
+            # EXPLICIT GRADIENT CALCULATION & UPDATE  (once per epoch)
             # --------------------------------------------------------- #
-            data_grad = torch.autograd.grad(outputs=loss, inputs=adv_patch)[0]
 
-            # FGSM Update Step
-            tmp_adv_patch = adv_patch.detach() - fgsm_epsilon * data_grad.sign()
+            # FGSM Update Step:
+            # Per the document: x' = x + ε·sign(∇_x J)
+            # Here adv_patch plays the role of x (the full adversarial image/noise),
+            # and avg_grad = ∂loss/∂adv_patch flows through applied_patch = clamp(img + adv_patch * mask).
+            # We SUBTRACT because we are minimizing the loss (maximizing detections).
+            tmp_adv_patch = adv_patch.detach() - fgsm_epsilon * avg_grad.sign()
 
             # --------------------------------------------------------- #
-            # PROJECTION
+            # PROJECTION  (L∞ ball around base_patch, per BIM/PGD paper)
             # --------------------------------------------------------- #
-            perturbation = tmp_adv_patch - base_patch
-            norm = torch.sqrt(torch.sum(torch.square(perturbation)))
-
-            factor = min(1.0, pgd_epsilon / norm.item()) if norm.item() > 0 else 1.0
-            perturbation = perturbation * factor
+            # Clamp the per-element perturbation to [-pgd_epsilon, +pgd_epsilon]
+            # then clamp the resulting patch to valid pixel range [0, 1].
+            perturbation = torch.clamp(tmp_adv_patch - base_patch, -pgd_epsilon, pgd_epsilon)
 
             with torch.no_grad():
                 adv_patch = torch.clamp(base_patch + perturbation, 0.0, 1.0)
@@ -264,6 +330,12 @@ class PhantomGenerator:
             if curr_iter % 10 == 0:
                 img_save_path = save_patch_dir / f'iter={curr_iter}.PNG'
                 transforms.ToPILImage()(adv_patch.detach().cpu()).save(img_save_path)
+                # All metrics are per-image averages across the full epoch
+                avg_loss = epoch_loss / epoch_total_images
+                avg_max_obj = epoch_max_obj_loss / epoch_total_images
+                avg_dist = epoch_dist_loss / epoch_total_images
+                avg_candidates = epoch_pass_to_NMS / epoch_total_images  # avg candidate boxes per image
+                print(f"[Iter {curr_iter:4d}] loss={avg_loss:.6f} | avg candidate boxes/img={avg_candidates:.2f} | Obj loss={avg_max_obj:.6f} | Dist loss={avg_dist:.6f}")
 
         # --------------------------------------------------------- #
         # FINAL EXPORT
@@ -334,82 +406,85 @@ def run_attack(max_iter, fgsm_epsilon, img_paths, folder_name,
 
 if __name__ == '__main__':
     # ── Configuration ─────────────────────────────────────────────────────
-    MINI_BATCH_SIZE = 8  # images per mini-batch (tune to fit VRAM)
-    ITERATIONS = 500  # patch update steps per class
-    EPSILON = 0.005  # FGSM step size
+    MINI_BATCH_SIZE   = 10
+    ITERATIONS        = 500
+    EPSILON           = 0.05
 
-    GLOBAL_PATCH_PATH = Path('global_patch_checkpoint.pt')
+    OUTPUT_ROOT       = Path('generated_patches')   # ← all patches saved here
+    OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
 
     image_directories = [
-        r'C:\Users\rsvis\UTD\Sem 6\Data and applications security\Artifact eval\Repo\DetStorm\out_segments\1775285345',
-        r'C:\Users\rsvis\UTD\Sem 6\Data and applications security\Artifact eval\Repo\DetStorm\out_segments\1776223121',
+        r'\DetStorm\out_segments\1775285345',
+        r'\DetStorm\out_segments\1776223121',
     ]
 
     classes_important = {
-        'bridge', 'building', 'bus', 'car', 'ceiling', 'column', 'earth',
-        'floor', 'fence', 'grass', 'house', 'person', 'pole', 'road',
-        'rock', 'runway', 'sidewalk', 'signboard', 'traffic', 'truck', 'van',
+        'bridge', 'building', 'bus', 'car', 'person', 'pole', 'road', 'sidewalk', 'signboard', 'traffic', 'truck', 'van'
     }
 
-    # ── Resume / skip logic ───────────────────────────────────────────────
-    skip_until_class = None
-    found_skip = False
+    # ── Resume logic ──────────────────────────────────────────────────────
+    skip_until_class = None   # Set to a class name string to resume, e.g. 'car'
+    found_skip       = (skip_until_class is None)
 
-    global_patch = None
-    if GLOBAL_PATCH_PATH.exists():
-        global_patch = torch.load(GLOBAL_PATCH_PATH)
-        print(f"[Resume] Loaded global patch from {GLOBAL_PATCH_PATH}")
-    else:
-        print("[Start] No global patch found — cold start.")
+    # ── Build per-class image list across ALL directories ─────────────────
+    class_to_imgs = {}
 
-    # ── Main loop ─────────────────────────────────────────────────────────
     for root_dir in image_directories:
-        # Avoid error if path structure is incorrect
         if not os.path.exists(root_dir):
             print(f"[Warning] Directory {root_dir} not found. Skipping.")
             continue
 
-        # Reset skip state per directory so resume logic applies to each root independently
-        found_skip = (skip_until_class is None)
-
-        class_folders = sorted(glob.glob(os.path.join(root_dir, '*/')))
-
-        for cls_path in class_folders:
+        for cls_path in sorted(glob.glob(os.path.join(root_dir, '*/'))):
             folder_name = Path(cls_path).name
 
-            # Skip until the target class is reached
-            if skip_until_class is not None and not found_skip:
-                if folder_name == skip_until_class:
-                    print(f"[Skip] Resuming from class: {folder_name}")
-                    found_skip = True
-                else:
-                    continue
-
-            print(f"\n[Processing] Class: {folder_name}")
-            is_important = folder_name in classes_important
-
-            if not is_important:
-                print(f"  [Skip] Class '{folder_name}' is not in classes_important whitelist.")
+            if folder_name not in classes_important:
                 continue
 
             img_paths = sorted(glob.glob(os.path.join(cls_path, '*.jpg')))
             if not img_paths:
-                print(f"  [Skip] No .jpg images found in {folder_name}.")
                 continue
 
-            print(f"  Found {len(img_paths)} images | Starting optimization...")
+            if folder_name not in class_to_imgs:
+                class_to_imgs[folder_name] = []
+            class_to_imgs[folder_name].extend(img_paths)
 
-            global_patch = run_attack(
-                max_iter=ITERATIONS,
-                fgsm_epsilon=EPSILON,
-                img_paths=img_paths,
-                folder_name=folder_name,
-                mini_batch_size=MINI_BATCH_SIZE,
-                warm_start_patch=global_patch,
-            )
+    print(f"[Info] Found {len(class_to_imgs)} classes across all directories:")
+    for cls, imgs in sorted(class_to_imgs.items()):
+        print(f"  {cls}: {len(imgs)} images")
 
-            # Persist updated patch for crash recovery
-            torch.save(global_patch, GLOBAL_PATCH_PATH)
-            print(f"[Checkpoint] Global patch saved → {GLOBAL_PATCH_PATH}")
+    # ── Main loop — one independent patch per class ────────────────────────
+    for folder_name, img_paths in sorted(class_to_imgs.items()):
+
+        # Resume logic
+        if not found_skip:
+            if folder_name == skip_until_class:
+                print(f"[Resume] Resuming from class: {folder_name}")
+                found_skip = True
+            else:
+                print(f"[Skip] Skipping class: {folder_name}")
+                continue
+
+        # Output folder: generated_patches/<class_name>/
+        class_output_dir = OUTPUT_ROOT / folder_name
+        class_output_dir.mkdir(parents=True, exist_ok=True)
+
+        print(f"\n[Processing] Class: {folder_name} | {len(img_paths)} images | Output: {class_output_dir}")
+
+        class_patch = run_attack(
+            max_iter=ITERATIONS,
+            fgsm_epsilon=EPSILON,
+            img_paths=img_paths,
+            folder_name=str(class_output_dir),   # ← pass class output dir
+            mini_batch_size=MINI_BATCH_SIZE,
+            warm_start_patch=None,
+        )
+
+        # Save final patch as .pt and .PNG under generated_patches/<class_name>/
+        torch.save(class_patch, class_output_dir / 'final_patch.pt')
+        transforms.ToPILImage()(class_patch.cpu()).save(class_output_dir / 'final_patch.PNG')
+        print(f"[Saved] {class_output_dir / 'final_patch.PNG'} + final_patch.pt")
+
+        gc.collect()
+        torch.cuda.empty_cache()
 
     print("\n[Done] Pipeline execution complete.")
